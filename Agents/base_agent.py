@@ -6,7 +6,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback
 from typing import Dict, Any, List, Tuple, Optional
 import logging
-from ..Environment.financial_env import FinancialPlanningEnv
+from Environment.financial_env import FinancialPlanningEnv
 class RLAgentBase:
     def __init__(self, name: str, model_path: Optional[str] = None):
         self.name = name

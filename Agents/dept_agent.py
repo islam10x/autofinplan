@@ -21,7 +21,7 @@ class RLDebtAgent(RLAgentBase):
         }
         self.training_env = make_vec_env(
             lambda: self.create_environment(env_config),
-            n_envs=4
+            n_envs=46
         )
         
         # Use TD3 for debt management (good for continuous control)
@@ -39,6 +39,24 @@ class RLDebtAgent(RLAgentBase):
             target_noise_clip=0.5,
             tensorboard_log=f"./tensorboard/{self.name}/"
         )
+    def _profile_to_state(self, profile: Dict[str, Any]) -> np.ndarray:
+        """
+        Convert the user's financial profile into a numerical state vector.
+        This will be passed to the RL model for prediction.
+        """
+        income = profile.get("income", 0)
+        expenses = profile.get("expenses", 0)
+        debt = profile.get("debt", 0)
+        age = profile.get("age", 30)
+        assets = profile.get("assets", 0)
+        risk_map = {"low": 0, "moderate": 1, "high": 2}
+        risk_score = risk_map.get(profile.get("risk_tolerance", "moderate"), 1)
+        # Add a 7th feature, e.g. income-expense ratio or goal embedding (basic)
+        net_savings = income - expenses
+
+        return np.array([income, expenses, debt, age, assets, risk_score, net_savings], dtype=np.float32)
+
+
     
     def analyze_debt_strategy(self, user_profile: Dict[str, Any]) -> Dict[str, Any]:
         """RL-based debt management recommendations"""

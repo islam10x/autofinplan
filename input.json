@@ -1,0 +1,9 @@
+{
+  "income": 5000,
+  "expenses": 3000,
+  "debt": 15000,
+  "age": 30,
+  "assets": 25000,
+  "risk_tolerance": "moderate",
+  "financial_goals": "Save for retirement and pay off debt"
+}

@@ -1,5 +1,5 @@
-from ..Agents.Prortfolio_agent import RLPortfolioAgent
-from ..Agents.dept_agent import RLDebtAgent
+from Agents.Prortfolio_agent import RLPortfolioAgent
+from Agents.dept_agent import RLDebtAgent
 
 class RLTrainingService:
     """

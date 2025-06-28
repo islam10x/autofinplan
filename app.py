@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
+import time
 # Import your existing models and services
 from models.user_profile import UserProfile
 from services.rl_training_service import RLTrainingService
@@ -440,10 +440,175 @@ async def train_rl_agents(background_tasks: BackgroundTasks, timesteps: int = 50
     """Trigger RL agent training (runs in background)"""
     if not rl_service:
         raise HTTPException(status_code=503, detail="RL service not available")
-        
-    background_tasks.add_task(rl_service.train_all_agents, timesteps)
-    return {"message": f"RL training started with {timesteps} timesteps"}
+    
+    # Check if already training
+    current_state = rl_service.get_training_state()
+    if current_state["is_training"]:
+        raise HTTPException(
+            status_code=409, 
+            detail=f"Training already in progress (ID: {current_state['training_id']})"
+        )
+    
+    # Generate unique training ID
+    training_id = f"train_{int(time.time())}"
+    
+    # Start training in background
+    background_tasks.add_task(rl_service.train_all_agents, timesteps, training_id)
+    
+    return {
+        "message": f"RL training started with {timesteps} timesteps",
+        "training_id": training_id,
+        "agents": list(rl_service.agents.keys()),
+        "status_endpoint": f"/training-status/{training_id}"
+    }
 
+@app.post("/stop-training/")
+async def stop_training():
+    """Stop the currently running training"""
+    success, message = rl_service.stop_training()
+    
+    if not success:
+        raise HTTPException(status_code=404, detail=message)
+    
+    current_state = rl_service.get_training_state()
+    return {
+        "message": message,
+        "training_id": current_state["training_id"],
+        "current_agent": current_state["current_agent"],
+        "progress": current_state["progress"]
+    }
+
+@app.get("/training-status/")
+async def get_training_status():
+    """Get current training status"""
+    try:
+        status = rl_service.get_training_state()
+        
+        # Calculate elapsed time if training
+        if status["start_time"]:
+            elapsed_time = time.time() - status["start_time"]
+            status["elapsed_time_seconds"] = round(elapsed_time, 2)
+            
+            # Estimate remaining time based on progress
+            if status["progress"] > 0:
+                estimated_total_time = elapsed_time / (status["progress"] / 100)
+                remaining_time = estimated_total_time - elapsed_time
+                status["estimated_remaining_seconds"] = max(0, round(remaining_time, 2))
+        
+        # Add helpful error context
+        if status["status"] == "error" and "error_message" in status:
+            if "tqdm and rich" in status["error_message"]:
+                status["error_solution"] = "Run: pip install stable-baselines3[extra] or pip install tqdm rich"
+            elif "callback" in status["error_message"]:
+                status["error_solution"] = "Your agent doesn't support progress callbacks. Training will use fallback method."
+        
+        return status
+    except Exception as e:
+        return {
+            "error": "Failed to get training status",
+            "error_message": str(e),
+            "server_time": time.time()
+        }
+
+@app.get("/training-status/{training_id}")
+async def get_training_status_by_id(training_id: str):
+    """Get training status for a specific training ID"""
+    status = rl_service.get_training_state()
+    
+    if status["training_id"] != training_id:
+        raise HTTPException(status_code=404, detail="Training ID not found")
+    
+    return status
+
+@app.delete("/reset-training-state/")
+async def reset_training_state():
+    """Reset training state (use when training is stuck)"""
+    success, message = rl_service.reset_training_state()
+    
+    if not success:
+        raise HTTPException(status_code=409, detail=message)
+    
+    return {"message": message}
+
+@app.post("/save-models/")
+async def save_models(base_path: str = "./trained_models/"):
+    """Save all trained models"""
+    try:
+        saved_models = rl_service.save_models(base_path)
+        return {
+            "message": f"Saved {len(saved_models)} models",
+            "saved_models": saved_models,
+            "base_path": base_path
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save models: {str(e)}")
+
+@app.post("/load-models/")
+async def load_models(base_path: str = "./trained_models/"):
+    """Load pre-trained models"""
+    try:
+        loaded_models = rl_service.load_models(base_path)
+        return {
+            "message": f"Loaded {len(loaded_models)} models",
+            "loaded_models": loaded_models,
+            "base_path": base_path
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load models: {str(e)}")
+
+@app.post("/retry-training/")
+async def retry_training(background_tasks: BackgroundTasks, timesteps: int = 50000):
+    """Retry training after fixing errors"""
+    current_state = rl_service.get_training_state()
+    
+    # Only allow retry if previous training had an error
+    if current_state["status"] != "error":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Cannot retry. Current status: {current_state['status']}"
+        )
+    
+    # Reset the state first
+    success, message = rl_service.reset_training_state()
+    if not success:
+        raise HTTPException(status_code=500, detail=message)
+    
+    # Start new training
+    training_id = f"retry_{int(time.time())}"
+    background_tasks.add_task(rl_service.train_all_agents, timesteps, training_id)
+    
+    return {
+        "message": f"Retrying RL training with {timesteps} timesteps",
+        "training_id": training_id,
+        "previous_error": current_state.get("error_message", "Unknown error")
+    }
+
+@app.get("/debug-info/")
+async def get_debug_info():
+    """Get debug information about the service state"""
+    try:
+        current_state = rl_service.get_training_state()
+        return {
+            "service_status": "running",
+            "training_state": current_state,
+            "agents_available": list(rl_service.agents.keys()),
+            "server_time": time.time()
+        }
+    except Exception as e:
+        return {
+            "service_status": "error",
+            "error": str(e),
+            "server_time": time.time()
+        }
+async def health_check():
+    """Health check endpoint"""
+    current_state = rl_service.get_training_state()
+    return {
+        "status": "healthy",
+        "rl_service_available": rl_service is not None,
+        "current_training_status": current_state["status"],
+        "agents_available": list(rl_service.agents.keys())
+    }
 @app.get("/rl-status/")
 async def rl_status():
     """Check RL agent training status"""

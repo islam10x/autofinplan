@@ -1,19 +1,24 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import aiohttp
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
+from typing import Literal, Optional, List, Dict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import time
+from sqlalchemy.orm import Session
+from Data.database import get_db, User
 # Import your existing models and services
 from models.user_profile import UserProfile
 from services.rl_training_service import RLTrainingService
 from Agents.Hybrid_RL_LLM import HybridLLMRLAgent
 from ai.LLM_client import LLMClient
-
+import pprint
 # Import the classes from your original financial advisor code
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -24,6 +29,9 @@ import plaid
 from plaid.api import plaid_api
 from plaid.model.transactions_get_request import TransactionsGetRequest
 from plaid.model.accounts_get_request import AccountsGetRequest
+from pydantic import BaseModel
+from typing import Optional
+import copy
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -46,8 +54,15 @@ app.add_middleware(
 )
 
 from services.trending_stocks_service import TrendingStocksMixin
-
-
+class InvestmentAlertRequest(BaseModel):
+    user_email: EmailStr
+    risk_tolerance: Literal["conservative", "moderate", "aggressive"]
+class AutoExtractRequest(BaseModel):
+    email: str
+    age: int
+    plaid_access_token: str
+    risk_tolerance: Optional[str] = "moderate"
+    financial_goals: Optional[str] = None
 # Bank Data Extractor Class 
 class BankDataExtractor:
     """Extract financial data from bank accounts using Plaid API"""
@@ -141,13 +156,22 @@ class TrendingInvestmentAnalyzer(TrendingStocksMixin):
     async def get_trending_investments(self, risk_tolerance: str = "moderate") -> dict:
         try:
             trending_data = {}
-            trending_stocks = await self._get_trending_stocks()
-            trending_data["stocks"] = trending_stocks
-            crypto_trends = await self._get_crypto_trends()
-            trending_data["crypto"] = crypto_trends
-            sector_analysis = await self._get_sector_analysis()
-            trending_data["sectors"] = sector_analysis
+            
+            # Run all analyses concurrently
+            tasks = [
+                self._get_trending_stocks(),
+                self._get_crypto_trends(),
+                self._get_sector_analysis()
+            ]
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            trending_data["stocks"] = results[0] if not isinstance(results[0], Exception) else []
+            trending_data["crypto"] = results[1] if not isinstance(results[1], Exception) else []
+            trending_data["sectors"] = results[2] if not isinstance(results[2], Exception) else []
+            
             filtered_recommendations = self._filter_by_risk_tolerance(trending_data, risk_tolerance)
+            
             return {
                 "recommendations": filtered_recommendations,
                 "analysis_timestamp": datetime.now().isoformat(),
@@ -158,6 +182,7 @@ class TrendingInvestmentAnalyzer(TrendingStocksMixin):
             return {"error": str(e)}
     
     async def _get_crypto_trends(self) -> list:
+        """Optimized crypto trends with aiohttp"""
         try:
             url = "https://api.coingecko.com/api/v3/coins/markets"
             params = {
@@ -169,21 +194,23 @@ class TrendingInvestmentAnalyzer(TrendingStocksMixin):
                 "price_change_percentage": "24h,7d"
             }
             
-            response = requests.get(url, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return [
-                    {
-                        "symbol": coin["symbol"].upper(),
-                        "name": coin["name"],
-                        "current_price": coin["current_price"],
-                        "24h_change_percent": coin["price_change_percentage_24h"],
-                        "7d_change_percent": coin.get("price_change_percentage_7d_in_currency", 0),
-                        "market_cap": coin["market_cap"],
-                        "volume": coin["total_volume"]
-                    }
-                    for coin in data[:5]
-                ]
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return [
+                            {
+                                "symbol": coin["symbol"].upper(),
+                                "name": coin["name"],
+                                "current_price": float(coin["current_price"]) if coin["current_price"] else 0.0,
+                                "24h_change_percent": float(coin["price_change_percentage_24h"]) if coin["price_change_percentage_24h"] else 0.0,
+                                "7d_change_percent": float(coin.get("price_change_percentage_7d_in_currency", 0)),
+                                "market_cap": int(coin["market_cap"]) if coin["market_cap"] else 0,
+                                "volume": int(coin["total_volume"]) if coin["total_volume"] else 0
+                            }
+                            for coin in data[:5] if coin.get("current_price") is not None
+                        ]
             return []
             
         except Exception as e:
@@ -191,6 +218,7 @@ class TrendingInvestmentAnalyzer(TrendingStocksMixin):
             return []
     
     async def _get_sector_analysis(self) -> list:
+        """Optimized sector analysis with concurrent processing"""
         try:
             sector_etfs = {
                 "Technology": "XLK",
@@ -200,21 +228,22 @@ class TrendingInvestmentAnalyzer(TrendingStocksMixin):
                 "Consumer": "XLY"
             }
             
-            sector_performance = []
-            for sector, etf in sector_etfs.items():
-                ticker = yf.Ticker(etf)
-                hist = ticker.history(period="30d")
+            # Process sectors concurrently
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                tasks = [
+                    loop.run_in_executor(executor, self._get_sector_data, sector, etf)
+                    for sector, etf in sector_etfs.items()
+                ]
                 
-                if not hist.empty:
-                    current_price = hist['Close'].iloc[-1]
-                    month_change = ((current_price - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
-                    
-                    sector_performance.append({
-                        "sector": sector,
-                        "etf_symbol": etf,
-                        "30day_performance": float(month_change),
-                        "current_price": float(current_price)
-                    })
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                sector_performance = []
+                for result in results:
+                    if isinstance(result, dict) and result is not None:
+                        sector_performance.append(result)
+                    elif isinstance(result, Exception):
+                        logger.warning(f"Sector analysis error: {str(result)}")
             
             sector_performance.sort(key=lambda x: x["30day_performance"], reverse=True)
             return sector_performance
@@ -222,6 +251,27 @@ class TrendingInvestmentAnalyzer(TrendingStocksMixin):
         except Exception as e:
             logger.error(f"Sector analysis failed: {str(e)}")
             return []
+
+    def _get_sector_data(self, sector: str, etf: str) -> Dict:
+        """Get data for a single sector ETF"""
+        try:
+            ticker = yf.Ticker(etf)
+            hist = ticker.history(period="30d")
+            
+            if not hist.empty:
+                current_price = hist['Close'].iloc[-1]
+                month_change = ((current_price - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
+                
+                return {
+                    "sector": sector,
+                    "etf_symbol": etf,
+                    "30day_performance": float(month_change),
+                    "current_price": float(current_price)
+                }
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to get data for {sector} ({etf}): {str(e)}")
+            return None
     
     def _filter_by_risk_tolerance(self, trending_data: dict, risk_tolerance: str) -> dict:
         if risk_tolerance == "conservative":
@@ -253,29 +303,29 @@ class EmailNotificationService:
         self.email_user = os.getenv("EMAIL_USER")
         self.email_password = os.getenv("EMAIL_PASSWORD")
     
-    async def send_investment_alert(self, user_email: str, investment_data: dict):
+    async def send_investment_alert(self, user_email: str, html_body: str):
         if not self.email_user or not self.email_password:
             return {"status": "error", "message": "Email not configured"}
-            
+        
         try:
             msg = MIMEMultipart()
             msg['From'] = self.email_user
             msg['To'] = user_email
             msg['Subject'] = "🚀 AI Financial Advisor - Investment Alert"
-            
-            html_body = self._create_investment_email_html(investment_data)
+
             msg.attach(MIMEText(html_body, 'html'))
-            
+
             with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
                 server.starttls()
                 server.login(self.email_user, self.email_password)
                 server.send_message(msg)
-            
+
             return {"status": "success", "message": "Investment alert sent successfully"}
-            
+
         except Exception as e:
             logger.error(f"Email sending failed: {str(e)}")
             return {"status": "error", "message": str(e)}
+
     
     async def send_financial_plan_email(self, user_email: str, financial_plan: dict):
         if not self.email_user or not self.email_password:
@@ -316,7 +366,7 @@ class EmailNotificationService:
     
     def _create_investment_email_html(self, investment_data: dict) -> str:
         recommendations = investment_data.get("recommendations", {})
-        
+
         html = f"""
         <html>
         <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
@@ -324,38 +374,58 @@ class EmailNotificationService:
                 <h2 style="color: #2c3e50;">🚀 Trending Investment Opportunities</h2>
                 <p>AI-powered investment recommendations based on real-time market analysis:</p>
         """
-        
-        # Add stocks section
-        if recommendations.get("stocks"):
+
+        # ✅ Stocks section
+        stocks = recommendations.get("stocks", [])
+        if stocks:
             html += """
                 <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin: 20px 0;">
                     <h3 style="color: #e74c3c;">📈 Top Performing Stocks</h3>
                     <ul>
             """
-            for stock in recommendations.get("stocks", [])[:3]:
-                html += f"""
-                        <li><strong>{stock['symbol']}</strong> - {stock['name']}: 
-                        ${stock['current_price']:.2f} ({stock['5day_change_percent']:.2f}% 5-day change)</li>
-                """
+            for stock in stocks[:3]:
+                try:
+                    symbol = str(stock.get("symbol", "N/A"))
+                    name = str(stock.get("name", "Unknown"))
+                    price = float(stock.get("current_price") or 0)
+                    change = float(stock.get("5day_change_percent") or 0)
+
+                    html += f"""
+                        <li><strong>{symbol}</strong> - {name}: 
+                        ${price:.2f} ({change:.2f}% 5-day change)</li>
+                    """
+                except (ValueError, TypeError):
+                    continue
             html += "</ul></div>"
-        
-        # Add crypto section
-        if recommendations.get("crypto"):
+
+        # ✅ Crypto section
+        crypto = recommendations.get("crypto", [])
+        if crypto:
             html += """
                 <div style="background-color: #fff3cd; padding: 15px; border-radius: 5px; margin: 20px 0;">
                     <h3 style="color: #856404;">₿ Trending Cryptocurrencies</h3>
                     <ul>
             """
-            for crypto in recommendations.get("crypto", [])[:2]:
-                html += f"""
-                        <li><strong>{crypto['symbol']}</strong> - {crypto['name']}: 
-                        ${crypto['current_price']:.4f} ({crypto['24h_change_percent']:.2f}% 24h change)</li>
-                """
+            for coin in crypto[:2]:
+                try:
+                    symbol = str(coin.get("symbol", "N/A"))
+                    name = str(coin.get("name", "Unknown"))
+                    price = float(coin.get("current_price") or 0)
+                    change = float(coin.get("24h_change_percent") or 0)
+
+                    html += f"""
+                        <li><strong>{symbol}</strong> - {name}: 
+                        ${price:.4f} ({change:.2f}% 24h change)</li>
+                    """
+                except (ValueError, TypeError):
+                    continue
             html += "</ul></div>"
-        
+
+        # ✅ Footer
+        timestamp = str(investment_data.get('analysis_timestamp', 'N/A'))
         html += f"""
                 <p style="font-size: 12px; color: #666; margin-top: 30px;">
-                    <em>Analysis generated at {investment_data.get('analysis_timestamp', 'N/A')}</em>
+                    <em>Analysis generated at {timestamp}</em>
                 </p>
                 <p style="font-size: 12px; color: #666;">
                     <strong>Disclaimer:</strong> This is not financial advice. Consult with a financial advisor.
@@ -364,8 +434,9 @@ class EmailNotificationService:
         </body>
         </html>
         """
-        
+
         return html
+
 
 # Initialize services
 try:
@@ -385,9 +456,6 @@ email_service = EmailNotificationService()
 
 # Scheduler for periodic tasks
 scheduler = AsyncIOScheduler()
-
-# In-memory storage (replace with database in production)
-user_profiles = {}
 
 @app.on_event("startup")
 async def startup_event():
@@ -650,78 +718,214 @@ async def generate_rl_only_plan(profile: UserProfile):
 
 # Enhanced endpoints with auto-extraction and trending analysis
 @app.post("/auto-extract-profile/")
-async def auto_extract_user_profile(
-    email: str,
-    age: int,
-    plaid_access_token: str,
-    risk_tolerance: str = "moderate",
-    financial_goals: Optional[str] = None
-):
+async def auto_extract_user_profile(request: AutoExtractRequest , db: Session=Depends(get_db)):
     """Automatically extract user financial data from bank accounts"""
+    
+    def safe_get(data: Dict, key: str, default=None):
+        """Safely extract and serialize data from nested objects"""
+        if not isinstance(data, dict):
+            return default
+            
+        value = data.get(key, default)
+        return sanitize_value(value, default)
+    
+    def sanitize_value(value, default=None):
+        """Recursively sanitize values to ensure JSON serializability"""
+        try:
+            if value is None:
+                return default
+            elif isinstance(value, (str, int, float, bool)):
+                return value
+            elif isinstance(value, dict):
+                return {k: sanitize_value(v) for k, v in value.items()}
+            elif isinstance(value, (list, tuple)):
+                return [sanitize_value(item) for item in value]
+            elif hasattr(value, "to_dict"):
+                return sanitize_value(value.to_dict())
+            elif hasattr(value, "__dict__"):
+                # Handle objects with __dict__ but skip problematic attributes
+                obj_dict = {}
+                for k, v in value.__dict__.items():
+                    if not k.startswith('_') and not callable(v):
+                        obj_dict[k] = sanitize_value(v)
+                return obj_dict
+            else:
+                # For any other type, convert to string as last resort
+                return str(value)
+        except Exception as e:
+            print(f"Error sanitizing value {type(value)}: {e}")
+            return default
+
     try:
+        # Validate required fields
+        if not request.plaid_access_token:
+            raise HTTPException(
+                status_code=400, 
+                detail="plaid_access_token is required"
+            )
+        
+        if not request.email:
+            raise HTTPException(
+                status_code=400, 
+                detail="email is required"
+            )
+
         # Extract bank data
-        bank_data = await bank_extractor.extract_financial_data(plaid_access_token)
+        bank_data = await bank_extractor.extract_financial_data(request.plaid_access_token)
         
+        # Check if bank_data is valid
+        if not isinstance(bank_data, dict):
+            raise HTTPException(
+                status_code=500, 
+                detail="Invalid response from bank data extractor"
+            )
+                
         if "error" in bank_data:
-            raise HTTPException(status_code=400, detail=f"Bank data extraction failed: {bank_data['error']}")
-        
-        # Create enhanced user profile
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Bank data extraction failed: {bank_data['error']}"
+            )
+
+        # Extract financial data with safe_get and additional sanitization
+        income = safe_get(bank_data, "monthly_income", 0.0)
+        expenses = safe_get(bank_data, "monthly_expenses", 0.0)
+        debt = safe_get(bank_data, "estimated_debt", 0.0)
+        assets = safe_get(bank_data, "assets", 0.0)
+        summary = safe_get(bank_data, "accounts_summary", [])
+
+        # Ensure all values are JSON serializable
+        income = sanitize_value(income, 0.0)
+        expenses = sanitize_value(expenses, 0.0)
+        debt = sanitize_value(debt, 0.0)
+        assets = sanitize_value(assets, 0.0)
+        summary = sanitize_value(summary, [])
+
+        # Create enhanced profile
         enhanced_profile = UserProfile(
-            email=email,
-            income=bank_data.get("monthly_income"),
-            expenses=bank_data.get("monthly_expenses"),
-            debt=bank_data.get("estimated_debt"),
-            age=age,
-            assets=bank_data.get("assets"),
-            risk_tolerance=risk_tolerance,
-            financial_goals=financial_goals,
-            plaid_access_token=plaid_access_token
+            email=request.email,
+            income=income,
+            expenses=expenses,
+            debt=debt,
+            age=request.age,
+            assets=assets,
+            risk_tolerance=request.risk_tolerance,
+            financial_goals=request.financial_goals,
+            plaid_access_token=request.plaid_access_token
         )
+
+        # Store profile with sanitized data
+        profile_dict = enhanced_profile.dict()
+        sanitized_profile = sanitize_value(profile_dict)
+        existing_user = db.query(User).filter(User.email == request.email).first()
+
+        if existing_user:
+            for key, value in sanitized_profile.items():
+                setattr(existing_user, key, value)
+            db.commit()
+            db.refresh(existing_user)
+        else:
+            new_user = User(**sanitized_profile)
+            db.add(new_user)
+            db.commit()
+            db.refresh(new_user)
         
-        # Store user profile
-        user_profiles[email] = enhanced_profile.dict()
-        
+        # Debug output
+        print("\n\nDEBUG - ENHANCED PROFILE:")
+        pprint.pprint(sanitized_profile)
+
         return {
             "status": "success",
             "message": "Financial data extracted successfully",
-            "user_profile": enhanced_profile.dict(),
-            "bank_summary": bank_data.get("accounts_summary", []),
+            "user_profile": sanitized_profile,
+            "bank_summary": summary,
             "extraction_timestamp": datetime.now().isoformat()
         }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Auto-extraction failed: {str(e)}")
 
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        print(f"Unexpected error in auto_extract_user_profile: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Auto-extraction failed: {str(e)}"
+        )
 @app.get("/trending-investments/")
 async def get_trending_investments(risk_tolerance: str = "moderate"):
     """Get real-time trending investment recommendations"""
+    
+    # Validate risk_tolerance
+    valid_risk_levels = ["conservative", "moderate", "aggressive"]
+    if risk_tolerance not in valid_risk_levels:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid risk_tolerance. Must be one of: {valid_risk_levels}"
+        )
+    
     try:
         trending_data = await investment_analyzer.get_trending_investments(risk_tolerance)
+        
+        if not trending_data:
+            return {
+                "status": "success",
+                "trending_investments": [],
+                "message": "No trending investments found"
+            }
+        
         return {
             "status": "success",
-            "trending_investments": trending_data
+            "trending_investments": trending_data,
+            "risk_tolerance": risk_tolerance,
+            "timestamp": datetime.now().isoformat()
         }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Investment analysis failed: {str(e)}")
+        print(f"Error in get_trending_investments: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Investment analysis failed: {str(e)}"
+        )
 
 @app.post("/send-investment-alert/")
-async def send_investment_alert(user_email: str, risk_tolerance: str = "moderate"):
+async def send_investment_alert(alert_request: InvestmentAlertRequest):
     """Send trending investment alert via email"""
+
     try:
+        # Extract validated data
+        user_email = alert_request.user_email
+        risk_tolerance = alert_request.risk_tolerance
+
         # Get trending investments
         investment_data = await investment_analyzer.get_trending_investments(risk_tolerance)
-        
-        # Send email
-        email_result = await email_service.send_investment_alert(user_email, investment_data)
-        
+
+        if not investment_data:
+            raise HTTPException(
+                status_code=404,
+                detail="No trending investments found for the specified risk tolerance"
+            )
+
+        # Generate email content
+        email_service_instance = EmailNotificationService()
+        html_body = email_service_instance._create_investment_email_html(investment_data)
+
+        # Send the email
+        result = await email_service_instance.send_investment_alert(user_email, html_body)
+
         return {
             "status": "success",
             "message": "Investment alert sent successfully",
-            "email_status": email_result,
-            "investment_data": investment_data
+            "email_status": result,
+            "user_email": user_email,
+            "risk_tolerance": risk_tolerance,
+            "investment_count": len(investment_data.get("recommendations", {}).get("stocks", [])) +
+                                len(investment_data.get("recommendations", {}).get("crypto", [])),
+            "timestamp": datetime.now().isoformat()
         }
-        
+
+    except HTTPException:
+        raise  # Re-raise specific FastAPI errors
     except Exception as e:
+        print(f"Error in send_investment_alert: {e}")
         raise HTTPException(status_code=500, detail=f"Alert sending failed: {str(e)}")
 
 @app.post("/setup-daily-alerts/")
@@ -814,36 +1018,61 @@ async def generate_enhanced_hybrid_plan(profile: UserProfile):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Enhanced planning failed: {str(e)}")
-
+    
 # User management endpoints
 @app.post("/users/register/")
-async def register_user(profile: UserProfile):
+async def register_user(profile: UserProfile, db: Session = Depends(get_db)):
     """Register a new user"""
-    user_profiles[profile.email] = profile.dict()
+
+    # Check if user already exists
+    existing_user = db.query(User).filter(User.email == profile.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    # Create new user object
+    new_user = User(**profile.dict())
+
+    # Add to database
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
     return {
         "status": "success",
         "message": "User registered successfully",
-        "user_email": profile.email
+        "user_email": new_user.email
     }
-
 @app.get("/users/{email}/profile/")
-async def get_user_profile(email: str):
-    """Get user profile"""
-    if email not in user_profiles:
-        raise HTTPException(status_code=404, detail="User not found")
-    return user_profiles[email]
+async def get_user_profile(email: str, db : Session= Depends(get_db) ):
+    existing_user = db.query(User).filter(User.email == email).first()
+    if (not existing_user):
+        raise HTTPException(status_code=400, detail="User doesnt exist")
+    return {"status": "success", 
+            "User Details":existing_user
+            }
 
 @app.put("/users/{email}/profile/")
-async def update_user_profile(email: str, profile: UserProfile):
+async def update_user_profile(email: str, profile: UserProfile, db: Session = Depends(get_db)):
     """Update user profile"""
-    if email not in user_profiles:
-        raise HTTPException(status_code=404, detail="User not found")
-    user_profiles[email] = profile.dict()
+    existing_user = db.query(User).filter(User.email == email).first()
+
+    if not existing_user:
+        raise HTTPException(status_code=400, detail="User doesn't exist")
+
+    # Update fields
+    profile_data = profile.dict(exclude_unset=True)  # Only fields that were provided
+    for key, value in profile_data.items():
+        setattr(existing_user, key, value)
+
+    db.commit()
+    db.refresh(existing_user)
+
     return {
         "status": "success",
-        "message": "Profile updated successfully"
+        "message": "Profile updated successfully",
+        "user_email": existing_user.email
     }
-
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

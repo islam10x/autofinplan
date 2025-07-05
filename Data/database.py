@@ -1,12 +1,22 @@
-# database.py - Add this file for production database support
 
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import os
+from dotenv import load_dotenv
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./financial_advisor.db")
+load_dotenv()  # Load from .env if available
+
+# Use Supabase PostgreSQL URL (replace with your actual URL or set in .env)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set. Please set it in the environment or .env file.")
+
+# Optional fix if Supabase gives you a 'postgres://' URI (SQLAlchemy wants 'postgresql://')
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -37,7 +47,7 @@ class InvestmentAlert(Base):
     alert_data = Column(Text)  # JSON string
     sent_at = Column(DateTime, default=datetime.utcnow)
 
-# Create tables
+# Create tables in Supabase
 Base.metadata.create_all(bind=engine)
 
 # Database dependency

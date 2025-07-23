@@ -1,7 +1,8 @@
+
 import numpy as np
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .base_agent import RLAgentBase
 
 class RLPortfolioAgent(RLAgentBase):
@@ -9,13 +10,19 @@ class RLPortfolioAgent(RLAgentBase):
     RL Agent specialized for portfolio allocation decisions
     """
     
-    def __init__(self, algorithm: str = "PPO"):
-        super().__init__("portfolio_agent")
+    def __init__(self, algorithm: str = "PPO", model_path: Optional[str] = None, 
+                 load_pretrained: bool = False):
+        super().__init__("portfolio_agent", model_path)
         self.algorithm = algorithm
-        self.setup_model()
+        self.load_pretrained = load_pretrained
+        
+        if load_pretrained and model_path:
+            self.load_pretrained_model(model_path)
+        else:
+            self.setup_model()
     
     def setup_model(self):
-        """Initialize the RL model"""
+        """Initialize the RL model for training"""
         # Create training environment
         env_config = {
             'max_steps': 120,
@@ -57,10 +64,34 @@ class RLPortfolioAgent(RLAgentBase):
         else:
             raise ValueError(f"Unsupported algorithm: {self.algorithm}")
     
+    def load_pretrained_model(self, model_path: str):
+        """Load a pre-trained model for inference only"""
+        try:
+            # Create a dummy environment for model loading
+            env_config = {
+                'max_steps': 120,
+                'focus': 'portfolio_optimization'
+            }
+            dummy_env = self.create_environment(env_config)
+            
+            # Load the model based on algorithm
+            if self.algorithm == "PPO":
+                self.model = PPO.load(model_path, env=dummy_env)
+            elif self.algorithm == "SAC":
+                self.model = SAC.load(model_path, env=dummy_env)
+            else:
+                raise ValueError(f"Unsupported algorithm: {self.algorithm}")
+            
+            self.logger.info(f"Pre-trained model loaded from {model_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load pre-trained model: {e}")
+            raise
+    
     def analyze_portfolio(self, user_profile: Dict[str, Any]) -> Dict[str, Any]:
         """Use trained RL agent to recommend portfolio allocation"""
         if self.model is None:
-            raise ValueError("Model not trained")
+            raise ValueError("Model not trained or loaded")
         
         # Convert user profile to environment state
         state = self._profile_to_state(user_profile)

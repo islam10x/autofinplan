@@ -1,7 +1,7 @@
 import numpy as np
 from stable_baselines3 import TD3
 from stable_baselines3.common.env_util import make_vec_env
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .base_agent import RLAgentBase
 
 class RLDebtAgent(RLAgentBase):
@@ -9,9 +9,14 @@ class RLDebtAgent(RLAgentBase):
     RL Agent specialized for debt management strategies
     """
     
-    def __init__(self):
-        super().__init__("debt_agent")
-        self.setup_model()
+    def __init__(self, model_path: Optional[str] = None, load_pretrained: bool = False):
+        super().__init__("debt_agent", model_path)
+        self.load_pretrained = load_pretrained
+        
+        if load_pretrained and model_path:
+            self.load_pretrained_model(model_path)
+        else:
+            self.setup_model()
     
     def setup_model(self):
         """Initialize specialized debt management RL model"""
@@ -21,7 +26,7 @@ class RLDebtAgent(RLAgentBase):
         }
         self.training_env = make_vec_env(
             lambda: self.create_environment(env_config),
-            n_envs=46
+            n_envs=4  # Reduced for consistency
         )
         
         # Use TD3 for debt management (good for continuous control)
@@ -39,6 +44,26 @@ class RLDebtAgent(RLAgentBase):
             target_noise_clip=0.5,
             tensorboard_log=f"./tensorboard/{self.name}/"
         )
+    
+    def load_pretrained_model(self, model_path: str):
+        """Load a pre-trained TD3 model for inference only"""
+        try:
+            # Create a dummy environment for model loading
+            env_config = {
+                'max_steps': 60,
+                'focus': 'debt_optimization'
+            }
+            dummy_env = self.create_environment(env_config)
+            
+            # Load the TD3 model
+            self.model = TD3.load(model_path, env=dummy_env)
+            
+            self.logger.info(f"Pre-trained debt model loaded from {model_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load pre-trained debt model: {e}")
+            raise
+    
     def _profile_to_state(self, profile: Dict[str, Any]) -> np.ndarray:
         """
         Convert the user's financial profile into a numerical state vector.
@@ -56,12 +81,10 @@ class RLDebtAgent(RLAgentBase):
 
         return np.array([income, expenses, debt, age, assets, risk_score, net_savings], dtype=np.float32)
 
-
-    
     def analyze_debt_strategy(self, user_profile: Dict[str, Any]) -> Dict[str, Any]:
         """RL-based debt management recommendations"""
         if self.model is None:
-            raise ValueError("Model not trained")
+            raise ValueError("Model not trained or loaded")
         
         state = self._profile_to_state(user_profile)
         action, _states = self.predict(state)

@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .base_agent import RLAgentBase
 
 class HybridLLMRLAgent:
@@ -68,14 +68,28 @@ Provide your analysis in JSON format:
         Combine RL agent recommendations with LLM reasoning
         """
         try:
-            # Get RL recommendations
+            # Get RL recommendations with error handling for individual agents
             rl_recommendations = {}
             
+            # Portfolio recommendations (PPO/SAC)
             if 'portfolio' in self.rl_agents:
-                rl_recommendations['portfolio'] = self.rl_agents['portfolio'].analyze_portfolio(user_profile)
+                try:
+                    rl_recommendations['portfolio'] = self.rl_agents['portfolio'].analyze_portfolio(user_profile)
+                except Exception as e:
+                    self.logger.warning(f"Portfolio agent failed: {e}")
+                    rl_recommendations['portfolio'] = {"error": "Portfolio analysis unavailable"}
             
+            # Debt recommendations (TD3)
             if 'debt' in self.rl_agents:
-                rl_recommendations['debt'] = self.rl_agents['debt'].analyze_debt_strategy(user_profile)
+                try:
+                    rl_recommendations['debt'] = self.rl_agents['debt'].analyze_debt_strategy(user_profile)
+                except Exception as e:
+                    self.logger.warning(f"Debt agent failed: {e}")
+                    rl_recommendations['debt'] = {"error": "Debt analysis unavailable"}
+            
+            # Validate that we have at least one working recommendation
+            if not rl_recommendations or all(isinstance(rec, dict) and "error" in rec for rec in rl_recommendations.values()):
+                return self._fallback_integration({}, user_profile)
             
             # Get LLM analysis of RL recommendations
             prompt = self.integration_prompt.format(
@@ -88,6 +102,7 @@ Provide your analysis in JSON format:
             try:
                 llm_analysis = json.loads(llm_response)
             except json.JSONDecodeError:
+                self.logger.warning("LLM response parsing failed, using fallback")
                 return self._fallback_integration(rl_recommendations, user_profile)
             
             # Combine RL precision with LLM wisdom
@@ -101,7 +116,8 @@ Provide your analysis in JSON format:
                 },
                 "method": "hybrid_rl_llm",
                 "confidence": 0.92,  # High confidence from combining both approaches
-                "reasoning": llm_analysis.get("confidence_reasoning", "")
+                "reasoning": llm_analysis.get("confidence_reasoning", ""),
+                "agent_status": self._get_agent_status()
             }
             
             return hybrid_recommendation
@@ -111,11 +127,92 @@ Provide your analysis in JSON format:
             return self._fallback_integration(rl_recommendations if 'rl_recommendations' in locals() else {}, user_profile)
     
     def _fallback_integration(self, rl_recs: Dict[str, Any], user_profile: Dict[str, Any]) -> Dict[str, Any]:
-        """Simple fallback when hybrid integration fails"""
+        """Enhanced fallback when hybrid integration fails"""
+        # Try to create basic recommendations from available RL data
+        fallback_recommendations = {}
+        
+        # Extract portfolio recommendations if available
+        if 'portfolio' in rl_recs and 'error' not in rl_recs['portfolio']:
+            portfolio_data = rl_recs['portfolio']
+            fallback_recommendations.update({
+                "portfolio_allocation": portfolio_data.get("rl_allocation", {}),
+                "savings_rate": portfolio_data.get("rl_savings_rate", 0.1),
+                "method": portfolio_data.get("method", "rl_fallback")
+            })
+        
+        # Extract debt recommendations if available
+        if 'debt' in rl_recs and 'error' not in rl_recs['debt']:
+            debt_data = rl_recs['debt']
+            fallback_recommendations.update({
+                "debt_payment_rate": debt_data.get("rl_debt_payment_rate", 0.1),
+                "debt_strategy": debt_data.get("rl_strategy", "balanced_approach"),
+                "priority": debt_data.get("priority", "medium")
+            })
+        
         return {
             "hybrid_approach": {
                 "rl_base_recommendations": rl_recs,
-                "method": "rl_only_fallback"
+                "method": "rl_only_fallback",
+                "final_recommendations": fallback_recommendations
             },
-            "confidence": 0.7
+            "confidence": 0.7,
+            "agent_status": self._get_agent_status()
         }
+    
+    def _get_agent_status(self) -> Dict[str, str]:
+        """Get status of all RL agents"""
+        status = {}
+        for agent_name, agent in self.rl_agents.items():
+            if agent.model is not None:
+                status[agent_name] = "loaded"
+            else:
+                status[agent_name] = "not_loaded"
+        return status
+
+
+# Factory function to create hybrid agent with pre-trained models
+def create_hybrid_agent_with_pretrained_models(
+    llm_client, 
+    portfolio_model_path: Optional[str] = None,
+    debt_model_path: Optional[str] = None,
+    portfolio_algorithm: str = "PPO"
+) -> HybridLLMRLAgent:
+    """
+    Create a hybrid agent with pre-trained RL models
+    
+    Args:
+        llm_client: LLM client for reasoning
+        portfolio_model_path: Path to pre-trained portfolio model
+        debt_model_path: Path to pre-trained debt model
+        portfolio_algorithm: Algorithm for portfolio agent ("PPO" or "SAC")
+    
+    Returns:
+        Configured HybridLLMRLAgent
+    """
+    from .Prortfolio_agent import RLPortfolioAgent
+    from .dept_agent import RLDebtAgent
+    
+    rl_agents = {}
+    
+    # Load portfolio agent if model path provided
+    if portfolio_model_path:
+        try:
+            rl_agents['portfolio'] = RLPortfolioAgent(
+                algorithm=portfolio_algorithm,
+                model_path=portfolio_model_path,
+                load_pretrained=True
+            )
+        except Exception as e:
+            logging.error(f"Failed to load portfolio agent: {e}")
+    
+    # Load debt agent if model path provided
+    if debt_model_path:
+        try:
+            rl_agents['debt'] = RLDebtAgent(
+                model_path=debt_model_path,
+                load_pretrained=True
+            )
+        except Exception as e:
+            logging.error(f"Failed to load debt agent: {e}")
+    
+    return HybridLLMRLAgent(llm_client, rl_agents)

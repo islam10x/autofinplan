@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Literal, Optional, List, Dict
+from typing import Any, Literal, Optional, List, Dict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import time
 from sqlalchemy.orm import Session
@@ -14,7 +14,7 @@ from Data.database import get_db, User
 # Import your existing models and services
 from models.user_profile import UserProfile
 from services.rl_training_service import RLTrainingService
-from Agents.Hybrid_RL_LLM import HybridLLMRLAgent
+from Agents.Hybrid_RL_LLM import HybridLLMRLAgent, create_hybrid_agent_with_pretrained_models
 from ai.LLM_client import LLMClient
 import pprint
 # Import the classes from your original financial advisor code
@@ -37,6 +37,11 @@ import copy
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MODEL_CONFIG = {
+    "portfolio_model_path": os.getenv("PORTFOLIO_MODEL_PATH", "./trained_models/portfolio_model.zip"),
+    "debt_model_path": os.getenv("DEBT_MODEL_PATH", "./trained_models/debt_model.zip"),
+    "portfolio_algorithm": os.getenv("PORTFOLIO_ALGORITHM", "PPO")  # PPO or SAC
+}
 # Initialize FastAPI app
 app = FastAPI(
     title="Enhanced RL + LLM Financial Planning Service",
@@ -63,7 +68,52 @@ class AutoExtractRequest(BaseModel):
     plaid_access_token: str
     risk_tolerance: Optional[str] = "moderate"
     financial_goals: Optional[str] = None
-# Bank Data Extractor Class 
+def safe_get(data: Dict, key: str, default=None):
+    """Safely extract and serialize data from nested objects"""
+    if not isinstance(data, dict):
+        return default
+        
+    value = data.get(key, default)
+    return sanitize_value(value, default)
+
+def sanitize_value(value, default=None):
+    """Recursively sanitize values to ensure JSON serializability"""
+    try:
+        if value is None:
+            return default
+        elif isinstance(value, (str, int, float, bool)):
+            return value
+        elif isinstance(value, dict):
+            return {k: sanitize_value(v) for k, v in value.items()}
+        elif isinstance(value, (list, tuple)):
+            return [sanitize_value(item) for item in value]
+        elif hasattr(value, "to_dict"):
+            return sanitize_value(value.to_dict())
+        elif hasattr(value, "__dict__"):
+            # Handle objects with __dict__ but skip problematic attributes
+            obj_dict = {}
+            for k, v in value.__dict__.items():
+                if not k.startswith('_') and not callable(v):
+                    obj_dict[k] = sanitize_value(v)
+            return obj_dict
+        else:
+            # For any other type, convert to string as last resort
+            return str(value)
+    except Exception as e:
+        logger.error(f"Error sanitizing value {type(value)}: {e}")
+        return default 
+def user_to_dict(user: User) -> Dict[str, Any]:
+    """Convert User SQLAlchemy model to dictionary"""
+    try:
+        user_dict = {}
+        for column in user.__table__.columns:
+            value = getattr(user, column.name)
+            user_dict[column.name] = sanitize_value(value)
+        return user_dict
+    except Exception as e:
+        logger.error(f"Error converting user to dict: {e}")
+        return {}
+# Bank Data Extractor Class
 class BankDataExtractor:
     """Extract financial data from bank accounts using Plaid API"""
     
@@ -438,15 +488,44 @@ class EmailNotificationService:
         return html
 
 
+
+llm_client = LLMClient(os.getenv("OPENAI_API_KEY", ""))
+# Initialize hybrid agent with pre-trained models
+def initialize_hybrid_agent() -> Optional[object]:
+    """Initialize hybrid agent with pre-trained models"""
+    try:
+        # Check if model files exist
+        portfolio_model_exists = os.path.exists(MODEL_CONFIG["portfolio_model_path"])
+        debt_model_exists = os.path.exists(MODEL_CONFIG["debt_model_path"])
+        
+        if not portfolio_model_exists and not debt_model_exists:
+            logging.warning("No pre-trained models found. Hybrid agent will be disabled.")
+            return None
+        
+        # Create hybrid agent with available models
+        hybrid_agent = create_hybrid_agent_with_pretrained_models(
+            llm_client=llm_client,
+            portfolio_model_path=MODEL_CONFIG["portfolio_model_path"] if portfolio_model_exists else None,
+            debt_model_path=MODEL_CONFIG["debt_model_path"] if debt_model_exists else None,
+            portfolio_algorithm=MODEL_CONFIG["portfolio_algorithm"]
+        )
+        
+        logging.info(f"Hybrid agent initialized successfully")
+        logging.info(f"Portfolio model: {'loaded' if portfolio_model_exists else 'not available'}")
+        logging.info(f"Debt model: {'loaded' if debt_model_exists else 'not available'}")
+        
+        return hybrid_agent
+        
+    except Exception as e:
+        logging.error(f"Failed to initialize hybrid agent: {e}")
+        return None
 # Initialize services
 try:
     rl_service = RLTrainingService()
-    llm_client = LLMClient(os.getenv("OPENAI_API_KEY", ""))
-    hybrid_agent = HybridLLMRLAgent(llm_client, rl_service.agents) if hasattr(rl_service, 'agents') else None
+    hybrid_agent = initialize_hybrid_agent()
 except Exception as e:
     logger.error(f"Failed to initialize RL/LLM services: {str(e)}")
     rl_service = None
-    llm_client = None
     hybrid_agent = None
 
 # Initialize other services
@@ -960,45 +1039,86 @@ async def send_daily_investment_alert(user_email: str, risk_tolerance: str):
     except Exception as e:
         logger.error(f"Daily alert failed for {user_email}: {str(e)}")
 
-@app.post("/enhanced-hybrid-plan/")
-async def generate_enhanced_hybrid_plan(profile: UserProfile):
+@app.post("/enhanced-hybrid-plan/{email}")
+async def generate_enhanced_hybrid_plan(email: str, db: Session = Depends(get_db)):
     """Generate enhanced financial plan with auto-extracted data and trending investments"""
     try:
-        user_dict = profile.dict()
+        # Get user from database
+        existing_user = db.query(User).filter(User.email == email).first()
+        if not existing_user:
+            raise HTTPException(status_code=404, detail="User doesn't exist")
+        
+        # Convert User object to dictionary properly
+        user_dict = user_to_dict(existing_user)
         
         # If bank token provided, extract fresh data
-        if profile.plaid_access_token:
-            bank_data = await bank_extractor.extract_financial_data(profile.plaid_access_token)
-            if "error" not in bank_data:
-                # Update profile with fresh bank data
-                for key, value in bank_data.items():
-                    if key in user_dict and value is not None:
-                        user_dict[key] = value
+        if user_dict.get('plaid_access_token'):
+            try:
+                bank_data = await bank_extractor.extract_financial_data(user_dict['plaid_access_token'])
+                if bank_data and "error" not in bank_data:
+                    # Update user with fresh bank data
+                    update_fields = ['assets', 'monthly_income', 'monthly_expenses', 'estimated_debt']
+                    for field in update_fields:
+                        if field in bank_data and bank_data[field] is not None:
+                            # Map bank data fields to user fields
+                            user_field = 'income' if field == 'monthly_income' else \
+                                        'expenses' if field == 'monthly_expenses' else \
+                                        'debt' if field == 'estimated_debt' else field
+                            setattr(existing_user, user_field, bank_data[field])
+                            user_dict[user_field] = bank_data[field]
+                    
+                    db.commit()
+                    db.refresh(existing_user)
+            except Exception as e:
+                logger.warning(f"Failed to update bank data: {str(e)}")
         
         # Get trending investments for the user's risk tolerance
-        trending_investments = await investment_analyzer.get_trending_investments(profile.risk_tolerance)
+        risk_tolerance = user_dict.get('risk_tolerance', 'moderate')
+        trending_investments = {}
+        try:
+            trending_investments = await investment_analyzer.get_trending_investments(risk_tolerance)
+        except Exception as e:
+            logger.warning(f"Failed to get trending investments: {str(e)}")
+            trending_investments = {"error": str(e)}
         
         # Generate hybrid plan if available
         hybrid_plan = None
+        
+        
         if hybrid_agent:
             try:
                 hybrid_plan = await hybrid_agent.generate_hybrid_recommendation(user_dict)
             except Exception as e:
                 logger.warning(f"Hybrid agent failed, using fallback: {str(e)}")
+        else:
+            logger.info("Hybrid agent not available, skipping AI analysis")
         
-        # Create enhanced plan
+        # Create enhanced plan with safe data handling
         enhanced_plan = {
-            "user_profile": user_dict,
+            "user_profile": {
+                "email": user_dict.get('email'),
+                "income": user_dict.get('income', 0),
+                "expenses": user_dict.get('expenses', 0),
+                "debt": user_dict.get('debt', 0),
+                "assets": user_dict.get('assets', 0),
+                "age": user_dict.get('age'),
+                "risk_tolerance": user_dict.get('risk_tolerance', 'moderate'),
+                "financial_goals": user_dict.get('financial_goals')
+            },
             "trending_opportunities": trending_investments,
             "hybrid_ai_analysis": hybrid_plan,
+            "ai_status": {
+                "hybrid_agent_available": hybrid_agent is not None,
+                "agent_status": hybrid_agent._get_agent_status() if hybrid_agent else {}
+            },
             "recommendations": {
                 "immediate_actions": [
                     "Review and optimize current portfolio allocation",
                     "Consider trending investment opportunities based on risk tolerance",
                     "Automate savings and investment contributions"
                 ],
-                "trending_investments": trending_investments.get("recommendations", {}),
-                "risk_assessment": f"Based on {profile.risk_tolerance} risk tolerance"
+                "trending_investments": trending_investments.get("recommendations", {}) if isinstance(trending_investments, dict) else {},
+                "risk_assessment": f"Based on {risk_tolerance} risk tolerance"
             },
             "next_review_date": (datetime.now() + timedelta(days=30)).isoformat(),
             "methodology": "hybrid_rl_llm_trending_analysis" if hybrid_plan else "trending_analysis_only"
@@ -1006,19 +1126,25 @@ async def generate_enhanced_hybrid_plan(profile: UserProfile):
         
         # Send email notification
         email_sent = False
-        if profile.email:
-            email_result = await email_service.send_financial_plan_email(profile.email, enhanced_plan)
-            email_sent = email_result.get("status") == "success"
+        if user_dict.get('email'):
+            try:
+                email_result = await email_service.send_financial_plan_email(user_dict['email'], enhanced_plan)
+                email_sent = email_result.get("status") == "success"
+            except Exception as e:
+                logger.warning(f"Failed to send email: {str(e)}")
         
         return {
             "status": "success",
             "enhanced_financial_plan": enhanced_plan,
-            "email_sent": email_sent
+            "email_sent": email_sent,
+            "user_email": user_dict.get('email')
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Enhanced planning failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Enhanced planning failed: {str(e)}")
-    
 # User management endpoints
 @app.post("/users/register/")
 async def register_user(profile: UserProfile, db: Session = Depends(get_db)):

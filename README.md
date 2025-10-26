@@ -15,11 +15,11 @@ FinPlanner is an AI-powered autonomous agent designed to help individuals make i
 ---
 
 ## 🛠️ Tech Stack
-- **LLMs**: GPT-4 / Claude / Mistral
+- **LLMs**: GPT-4
 - **RAG**: LangChain / LlamaIndex + ChromaDB or FAISS
 - **RL**: Stable-Baselines3, Gym-style environment
 - **Forecasting**: Prophet, NeuralProphet, or Darts
-- **Frontend**: React or React Native
+- **Frontend**: React
 - **APIs**: Yahoo Finance, Alpha Vantage, Plaid (optional)
 
 ---
@@ -45,6 +45,7 @@ autofinplan/
 2. **Planner Agent**: Uses RL to recommend optimal decisions (save, invest, budget)
 3. **Forecaster**: Predicts market trends (e.g. inflation, returns)
 4. **Feedback Loop**: Learns from user choices via RLHF or scoring
+5. **Plaid Integration**: for real-time user data
 
 ---
 
@@ -67,7 +68,6 @@ npm run dev
 
 ## 💡 Future Enhancements
 - Multi-agent collaboration (advisor, compliance, tax)
-- Plaid integration for real-time user data
 - Voice assistant interface (Whisper + GPT-4)
 - Portfolio optimization module
 

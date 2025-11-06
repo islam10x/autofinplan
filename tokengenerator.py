@@ -7,6 +7,7 @@ from plaid import Configuration, ApiClient, Environment
 import os
 from dotenv import load_dotenv
 
+load_dotenv()
 # Load config from .env
 PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID")
 PLAID_SECRET = os.getenv("PLAID_SECRET")

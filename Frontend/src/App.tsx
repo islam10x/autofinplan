@@ -58,7 +58,6 @@ const App = () => {
   const [loading, setLoading] = useState<boolean>(false);
   const [message, setMessage] = useState<Message>({ type: '', text: '' });  
   const [healthStatus, setHealthStatus] = useState<any>(null);
-  const [trainingStatus, setTrainingStatus] = useState<any>(null);
   const [trendingData, setTrendingData] = useState<FinancialPlan | null>(null);
   const [financialPlan, setFinancialPlan] = useState<any>(null);
 
@@ -93,9 +92,6 @@ const App = () => {
 
   useEffect(() => {
     checkHealthStatus();
-    if (activeTab === 'training') {
-      checkTrainingStatus();
-    }
   }, [activeTab]);
 
   const showMessage = (type: 'success' | 'error', text: string) => {
@@ -112,15 +108,7 @@ const App = () => {
     }
   };
 
-  const checkTrainingStatus = async () => {
-    try {
-      const response = await fetch(`${API_BASE}/training-status/`);
-      const data = await response.json();
-      setTrainingStatus(data);
-    } catch (error) {
-      console.error('Training status check failed:', error);
-    }
-  };
+ 
 
 const registerUser = async (e: React.FormEvent) => {
   e.preventDefault();
@@ -143,13 +131,16 @@ const registerUser = async (e: React.FormEvent) => {
     if (response.ok) {
       setUser(data.user_profile);
       showMessage('success', 'User registered successfully!');
+      setActiveTab('dashboard');
     } else {
       showMessage('error', data.detail || 'Registration failed');
     }
   } catch (error) {
     showMessage('error', 'Network error during registration');
+  }finally{
+    setLoading(false);
   }
-  setLoading(false);
+  
 };
 
   const autoExtractProfile = async (e: React.FormEvent) => {
@@ -260,43 +251,6 @@ const registerUser = async (e: React.FormEvent) => {
     setLoading(false);
   };
 
-  const startTraining = async () => {
-    setLoading(true);
-    try {
-      const response = await fetch(`${API_BASE}/train-rl-agents/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ timesteps: 50000 })
-      });
-      
-      const data = await response.json();
-      if (response.ok) {
-        showMessage('success', 'RL training started!');
-        checkTrainingStatus();
-      } else {
-        showMessage('error', data.detail || 'Training start failed');
-      }
-    } catch (error) {
-      showMessage('error', 'Network error starting training');
-    }
-    setLoading(false);
-  };
-
-  const stopTraining = async () => {
-    try {
-      const response = await fetch(`${API_BASE}/stop-training/`, { method: 'POST' });
-      const data = await response.json();
-      if (response.ok) {
-        showMessage('success', 'Training stopped');
-        checkTrainingStatus();
-      } else {
-        showMessage('error', data.detail || 'Stop training failed');
-      }
-    } catch (error) {
-      showMessage('error', 'Network error stopping training');
-    }
-  };
-
   const MessageAlert: React.FC<MessageAlertProps> = ({ message }) => {
   if (!message.text) return null;
   
@@ -356,7 +310,6 @@ const registerUser = async (e: React.FormEvent) => {
                 { id: 'extract', label: 'Auto Extract', icon: DollarSign },
                 { id: 'investments', label: 'Trending', icon: TrendingUp },
                 { id: 'alerts', label: 'Alerts', icon: Mail },
-                { id: 'training', label: 'AI Training', icon: Brain },
                 { id: 'status', label: 'System Status', icon: Settings }
               ].map(tab => {
                 const Icon = tab.icon;
@@ -558,7 +511,7 @@ const registerUser = async (e: React.FormEvent) => {
           {activeTab === 'extract' && (
             <div>
               <h2 className="page-title">Auto-Extract Financial Data</h2>
-              <div onSubmit={autoExtractProfile} className="form-container">
+              <div  className="form-container">
                 <div className="form-group">
                   <label className="form-label">Email</label>
                   <input
@@ -618,6 +571,7 @@ const registerUser = async (e: React.FormEvent) => {
                 <div className="form-group full-width">
                   <button
                     type="submit"
+                    onClick={autoExtractProfile}
                     disabled={loading}
                     className="submit-button extract-button"
                   >
@@ -751,63 +705,6 @@ const registerUser = async (e: React.FormEvent) => {
               </form>
             </div>
           )}
-
-          {activeTab === 'training' && (
-            <div>
-              <h2 className="page-title">AI Training Management</h2>
-              
-              <div className="training-section">
-                <div className="training-controls">
-                  <button
-                    onClick={startTraining}
-                    disabled={loading || trainingStatus?.status === 'running'}
-                    className="training-button start-button"
-                  >
-                    <Brain className="button-icon" />
-                    {loading ? 'Starting...' : 'Start Training'}
-                  </button>
-                  
-                  <button
-                    onClick={stopTraining}
-                    disabled={trainingStatus?.status !== 'running'}
-                    className="training-button stop-button"
-                  >
-                    <Clock className="button-icon" />
-                    Stop Training
-                  </button>
-                  
-                  <button
-                    onClick={checkTrainingStatus}
-                    className="training-button refresh-button"
-                  >
-                    <RefreshCw className="button-icon" />
-                    Refresh Status
-                  </button>
-                </div>
-
-                {trainingStatus && (
-                  <div className="training-status">
-                    <h3 className="status-title">Training Status</h3>
-                    <div className="status-info">
-                      <StatusBadge status={trainingStatus.status} label="Status" />
-                      {trainingStatus.progress && (
-                        <div className="progress-info">
-                          <p>Progress: {trainingStatus.progress}%</p>
-                          <div className="progress-bar">
-                            <div 
-                              className="progress-fill" 
-                              style={{ width: `${trainingStatus.progress}%` }}
-                            ></div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
           {activeTab === 'status' && (
             <div>
               <h2 className="page-title">System Status</h2>
@@ -827,14 +724,6 @@ const registerUser = async (e: React.FormEvent) => {
                     <StatusBadge 
                       status={healthStatus?.database || 'unknown'} 
                       label="Connection" 
-                    />
-                  </div>
-                  
-                  <div className="status-card">
-                    <h3 className="status-card-title">AI Training</h3>
-                    <StatusBadge 
-                      status={trainingStatus?.status || 'idle'} 
-                      label="Training" 
                     />
                   </div>
                 </div>

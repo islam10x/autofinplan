@@ -11,7 +11,7 @@ class LLMClient:
     async def generate_response(self, prompt: str, max_tokens: int = 1000) -> str:
         try:
             response = await self.client.chat.completions.create(
-                model="gpt-4",
+                model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
                 temperature=0.7

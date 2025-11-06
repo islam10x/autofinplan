@@ -240,7 +240,7 @@ class TrendingInvestmentAnalyzer(TrendingStocksMixin):
                 "order": "percent_change_24h_desc",
                 "per_page": 10,
                 "page": 1,
-                "sparkline": False,
+                "sparkline": "false",
                 "price_change_percentage": "24h,7d"
             }
             
